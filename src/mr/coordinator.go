@@ -3,6 +3,8 @@ package mr
 import (
 	"fmt"
 	"log"
+	"math"
+	"sync"
 	"time"
 )
 import "net"
@@ -10,70 +12,157 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-type Coordinator struct {
-	// Your definitions here.
-	files    []string
-	nReduce  int
-	nMap     int
-	tasks    map[Type][]*Task
-	applyCh  chan applyMsg
-	reportCh chan reportMsg
-	doneCh   chan struct{}
-}
-type applyMsg struct {
-	response *ApplyResponse
-	ok       chan struct{}
-}
-
-type reportMsg struct {
-	request *ReportRequest
-	ok      chan struct{}
-}
-
 const (
 	Timeout = 10
 )
 
+type Coordinator struct {
+	// Your definitions here.
+	mutex   sync.Mutex
+	files   []string
+	nMap    int
+	nReduce int
+	phase   Phase
+	taskMap map[int]Task
+	taskCh  chan Task
+}
+
+// utils
+func tmpMapOutFile(worker string, mi int, ri int) string {
+	return fmt.Sprintf("tmp-map-%s-%d-%d", worker, mi, ri)
+}
+
+func finalMapOutFile(mi int, ri int) string {
+	return fmt.Sprintf("mr-%d-%d", mi, ri)
+}
+
+func tmpReduceOutFile(worker string, ri int) string {
+	return fmt.Sprintf("tmp-reduce-%s-%d", worker, ri)
+}
+
+func finalReduceOutFile(ri int) string {
+	return fmt.Sprintf("mr-out-%d", ri)
+}
+
+func (c *Coordinator) initMapPhase() {
+	for i, file := range c.files {
+		task := Task{
+			TaskId:        i,
+			TaskType:      MapTask,
+			TaskInputFile: file,
+			MapNum:        c.nMap,
+			ReduceNum:     c.nReduce,
+		}
+		log.Printf("initMapPhase taskid %d nReduce %d\n", task.TaskId, task.ReduceNum)
+		c.taskMap[i] = task
+		c.taskCh <- task
+	}
+	log.Printf("initMapPhase sucess\n")
+}
+
+func (c *Coordinator) initReducePhase() {
+	for i := 0; i < c.nReduce; i++ {
+		task := Task{
+			TaskId:    i,
+			TaskType:  ReduceTask,
+			MapNum:    c.nMap,
+			ReduceNum: c.nReduce,
+		}
+		c.taskMap[i] = task
+		c.taskCh <- task
+	}
+	log.Printf("initReducePhase sucess\n")
+}
+
+func (c *Coordinator) initNextPhase() {
+	switch c.phase {
+	case Map:
+		c.phase = Reduce
+		c.initReducePhase()
+	case Reduce:
+		close(c.taskCh)
+		c.phase = Done
+		log.Printf("All tasks Done\n")
+	}
+}
+
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) Apply4Task(request *ApplyRequest, response *ApplyResponse) error {
-	msg := applyMsg{response, make(chan struct{})}
-	c.applyCh <- msg
-	<-msg.ok
+func (c *Coordinator) AssignTask(request *ApplyRequest, response *Task) error {
+	if request.CompletedTask != nil {
+		c.verifyAndCommit(request)
+	}
+	task, ok := <-c.taskCh
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.phase == Done {
+		task.TaskType = CompletedTask
+	} else if !ok {
+		task.TaskType = WaitTask
+		log.Printf("worker %s is waitting\n", task.WorkerId)
+	} else {
+		task.WorkerId = request.WorkerId
+		task.StartTime = time.Now()
+		c.taskMap[task.TaskId] = task
+		log.Printf("Assign %d task %d to worker %s\n", task.TaskType, task.TaskId, task.WorkerId)
+	}
+	*response = task
 	return nil
 }
 
-func (c *Coordinator) Report(request *ReportRequest, response *ReportResponse) error {
-	msg := reportMsg{request, make(chan struct{})}
-	c.reportCh <- msg
-	<-msg.ok
-	return nil
+func (c *Coordinator) verifyAndCommit(request *ApplyRequest) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	task := request.CompletedTask
+	_, exist := c.taskMap[task.TaskId]
+	log.Printf("get verify taskid %d\n", task.TaskId)
+	if exist && task.WorkerId == request.WorkerId {
+		switch task.TaskType {
+		case MapTask:
+			for ri := 0; ri < c.nReduce; ri++ {
+				err := os.Rename(
+					tmpMapOutFile(task.WorkerId, task.TaskId, ri),
+					finalMapOutFile(task.TaskId, ri))
+				if err != nil {
+					log.Printf(
+						"Failed to get map output file `%s` as final: %e",
+						tmpMapOutFile(task.WorkerId, task.TaskId, ri), err)
+				}
+			}
+		case ReduceTask:
+			err := os.Rename(
+				tmpReduceOutFile(task.WorkerId, task.TaskId),
+				finalReduceOutFile(task.TaskId))
+			if err != nil {
+				log.Printf(
+					"Failed to get reduce output file `%s` as final: %e",
+					tmpReduceOutFile(task.WorkerId, task.TaskId), err)
+			}
+		}
+		log.Printf("verify taskid %d success\n", task.TaskId)
+		delete(c.taskMap, task.TaskId)
+		if len(c.taskMap) == 0 {
+			c.initNextPhase()
+		}
+	}
 }
 
-// check task status
-func (c *Coordinator) checkTaskStatus(jobType Type, msg *applyMsg) bool {
-	TasksDone := true
-	for _, task := range c.tasks[jobType] {
-		if task.TaskStatus == Done && time.Now().After(task.DeadLine) {
-			task.TaskStatus = Waiting
+func (c *Coordinator) checkTaskStatus() {
+	for {
+		time.Sleep(1000 * time.Millisecond)
+		c.mutex.Lock()
+		if c.phase == Done {
+			c.mutex.Unlock()
+			break
 		}
-		if task.TaskStatus == Waiting {
-			msg.response.JobType = jobType
-			msg.response.TaskId = task.TaskId
-			msg.response.FileName = task.MapInputFile
-			msg.response.NReduce = c.nReduce
-			task.DeadLine = time.Now().Add(10 * time.Second)
-			task.TaskStatus = Working
-			return false
+		for _, task := range c.taskMap {
+			if task.WorkerId != "" && time.Now().After(task.StartTime.Add(Timeout*time.Second)) {
+				log.Printf("TimeOut crash: %d task %d  workerId %s.", task.TaskType, task.TaskId, task.WorkerId)
+				task.WorkerId = ""
+				c.taskCh <- task
+			}
 		}
-		if task.TaskStatus != Done {
-			TasksDone = false
-		}
+		c.mutex.Unlock()
 	}
-	if !TasksDone {
-		msg.response.JobType = WaitTask
-		return false
-	}
-	return true
 }
 
 //
@@ -107,73 +196,30 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-	select {
-	case <-c.doneCh:
-		time.Sleep(3 * time.Second)
-		return true
-	default:
-		return false
-	}
-	return ret
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.phase == Done
 }
 
 //
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
+// input filenames
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{
-		files:    files,
-		nMap:     len(files),
-		nReduce:  nReduce,
-		tasks:    map[Type][]*Task{},
-		applyCh:  make(chan applyMsg),
-		reportCh: make(chan reportMsg),
-		doneCh:   make(chan struct{}),
-	}
-	c.tasks[MapTask] = make([]*Task, 0, c.nMap)
-	c.tasks[ReduceTask] = make([]*Task, 0, c.nReduce)
 	// Your code here.
-	// create map reduce task
-	for _, file := range c.files {
-		c.tasks[MapTask] = append(c.tasks[MapTask], &Task{
-			MapInputFile: file,
-			TaskId:       len(c.tasks[MapTask]),
-			TaskStatus:   Waiting,
-		})
+	n := int(math.Max(float64(len(files)), float64(nReduce))) // channel capacity
+	c := Coordinator{
+		files:   files,
+		nMap:    len(files),
+		nReduce: nReduce,
+		phase:   Map,
+		taskMap: make(map[int]Task),
+		taskCh:  make(chan Task, n),
 	}
-	for i := 0; i < c.nReduce; i++ {
-		c.tasks[ReduceTask] = append(c.tasks[ReduceTask], &Task{
-			MapInputFile: "",
-			TaskId:       len(c.tasks[ReduceTask]),
-			TaskStatus:   Waiting,
-		})
-	}
-	go func() {
-		for {
-			select {
-			case msg := <-c.applyCh:
-				if c.checkTaskStatus(MapTask, &msg) || c.checkTaskStatus(ReduceTask, &msg) {
-					msg.response.JobType = ExitTask
-					c.doneCh <- struct{}{}
-				}
-				fmt.Printf("ApplyResponse: %#v\n", msg.response)
-				msg.ok <- struct{}{}
-			case msg := <-c.reportCh:
-				for _, task := range c.tasks[msg.request.JobType] {
-					if task.TaskId == msg.request.TaskId {
-						task.TaskStatus = msg.request.TaskStatus
-					}
-				}
-				fmt.Printf("ReportResponse: %#v\n", msg.request)
-				msg.ok <- struct{}{}
-			}
-		}
-	}()
+	log.Printf("Coordinator Start!\n")
+	c.initMapPhase()
 	c.server()
+	go c.checkTaskStatus()
 	return &c
 }

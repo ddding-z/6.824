@@ -26,54 +26,39 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-// 任务类型
-type Type int
+type TaskType int
 
 const (
-	_ Type = iota
+	_ TaskType = iota
 	MapTask
 	ReduceTask
-	WaitTask // 任务已分发结束，但仍在运行
-	ExitTask
+	WaitTask
+	CompletedTask
 )
 
-// 任务状态
-type Status int
+type Phase int
 
 const (
-	_ Status = iota
-	Waiting
-	Working
+	_ Phase = iota
+	Map
+	Reduce
 	Done
 )
 
 type Task struct {
-	TaskId       int
-	TaskType     Type
-	NReduce      int
-	TaskStatus   Status
-	MapInputFile string
-	//FileSlice    []string
-	DeadLine time.Time
+	TaskId        int
+	WorkerId      string
+	TaskType      TaskType
+	TaskInputFile string
+	MapNum        int
+	ReduceNum     int
+	StartTime     time.Time
 }
 
-// apply for task rpc
-type ApplyRequest struct{}
-
-type ApplyResponse struct {
-	JobType  Type
-	FileName string
-	NReduce  int
-	TaskId   int
+type ApplyRequest struct {
+	WorkerId      string
+	CompletedTask *Task
 }
-
-type ReportRequest struct {
-	JobType    Type
-	TaskId     int
-	TaskStatus Status
-}
-
-type ReportResponse struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

@@ -1,11 +1,12 @@
 package mr
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 import "log"
@@ -44,16 +45,34 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	// Your worker implementation here.
+	var completedTask *Task
 	for {
-		reply := doApply4Task()
-		switch reply.TaskType {
+		request := ApplyRequest{
+			WorkerId:      strconv.Itoa(os.Getpid()),
+			CompletedTask: completedTask,
+		}
+		response := Task{}
+		call(
+			"Coordinator.AssignTask",
+			&request,
+			&response,
+		)
+		//log.Printf("response taskid %d workerId %s\n", response.TaskId, response.WorkerId)
+		switch response.TaskType {
 		case MapTask:
-			doMapTask(mapf, &reply)
+			handleMapTask(mapf, &response)
+			completedTask = &response
+			//log.Printf("Worker: Finished Map Task %d", response.TaskId)
 		case ReduceTask:
-			doReduceTask(reducef, &reply)
+			handleReduceTask(reducef, &response)
+			completedTask = &response
+			//log.Printf("Worker: Finished Reduce Task %d", response.TaskId)
 		case WaitTask:
-			time.Sleep(1 * time.Second)
-		case ExitTask:
+			//log.Printf("Worker: wait one second %d", response.TaskId)
+			time.Sleep(1000 * time.Millisecond)
+			completedTask = nil
+		case CompletedTask:
+			//log.Printf("Finished All Tasks")
 			return
 		}
 	}
@@ -61,80 +80,78 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	// CallExample()
 }
 
-// apply for Task
-func doApply4Task() Task {
-	args := ApplyRequest{}
-	reply := Task{}
-	ok := call(
-		"Coordinator.Apply4Task",
-		&args,
-		&reply,
-	)
-	if ok {
-		fmt.Printf("Response: %v\n", reply)
-	} else {
-		fmt.Printf("Call failed!: %v\n", reply)
-	}
-	return reply
-}
-
-// revise func param
-func doMapTask(mapf func(string, string) []KeyValue, reply *Task) {
-	// Task Done
-	defer func() {
-		args := reply
-		reply_ := Task{}
-		ok := call("Coordinator.Report", &args, &reply_)
-		if ok {
-			fmt.Println("Response: %v\\n", reply)
-		} else {
-			fmt.Printf("call failed!\n")
-		}
-	}()
+func handleMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	// steal from main/mrsequential.go
-	file, err := os.Open(reply.MapInputFile)
+	file, err := os.Open(task.TaskInputFile)
 	if err != nil {
-		panic(fmt.Sprintf("cannot open %v", reply.MapInputFile))
+		panic(fmt.Sprintf("Failed to open %v", task.TaskInputFile))
 	}
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		panic(fmt.Sprintf("cannot read %v", reply.MapInputFile))
+		panic(fmt.Sprintf("Failed to read %v", task.TaskInputFile))
 	}
 	file.Close()
-	// ....
+
+	kva := mapf(task.TaskInputFile, string(content))
+	hashedKva := make(map[int][]KeyValue)
+	for _, kv := range kva {
+		hashedv := ihash(kv.Key) % task.ReduceNum
+		hashedKva[hashedv] = append(hashedKva[hashedv], kv)
+	}
+
+	for i := 0; i < task.ReduceNum; i++ {
+		ofile, _ := os.Create(tmpMapOutFile(task.WorkerId, task.TaskId, i))
+		for _, kv := range hashedKva[i] {
+			fmt.Fprintf(ofile, "%v\t%v\n", kv.Key, kv.Value)
+		}
+		ofile.Close()
+	}
 }
 
-func shuffle(files []string) []KeyValue {
-	var kva []KeyValue
-	for _, filepath := range files {
-		file, _ := os.Open(filepath)
-		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
-			if err := dec.Decode(&kv); err != nil {
-				break
-			}
-			kva = append(kva, kv)
+func handleReduceTask(reducef func(string, []string) string, task *Task) {
+	var lines []string
+	for mi := 0; mi < task.MapNum; mi++ {
+		inputFile := finalMapOutFile(mi, task.TaskId)
+		file, err := os.Open(inputFile)
+		if err != nil {
+			log.Fatalf("Failed to open map output file %s: %e", inputFile, err)
 		}
-		file.Close()
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("Failed to read map output file %s: %e", inputFile, err)
+		}
+		lines = append(lines, strings.Split(string(content), "\n")...)
+	}
+	var kva []KeyValue
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		kva = append(kva, KeyValue{
+			Key:   parts[0],
+			Value: parts[1],
+		})
 	}
 	sort.Sort(ByKey(kva))
-	return kva
-}
 
-func doReduceTask(reducef func(string, []string) string, reply *Task) {
-	// Task Done
-	defer func() {
-		args := reply
-		reply_ := Task{}
-		ok := call("Coordinator.Report", &args, &reply_)
-		if ok {
-			fmt.Println("Response: %v\\n", reply)
-		} else {
-			fmt.Printf("call failed!\n")
+	// steal from main/mrsequential.go
+	ofile, _ := os.Create(tmpReduceOutFile(task.WorkerId, task.TaskId))
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
 		}
-	}()
-	// ...
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		i = j
+	}
+	ofile.Close()
 }
 
 //
